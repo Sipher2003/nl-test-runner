@@ -2,9 +2,13 @@
 """Run a plain-English test case in a browser using an LLM-driven agent loop.
 
 Works with any OpenAI-compatible API (Groq by default).
-  export GROQ_API_KEY=gsk_...                 (or LLM_API_KEY for other providers)
-  export LLM_MODEL=openai/gpt-oss-120b        (optional)
-  export LLM_BASE_URL=https://api.groq.com/openai/v1   (optional)
+  GROQ_API_KEY (or LLM_API_KEY)  API key
+  LLM_MODELS                     comma-separated models; falls back to the next on daily-quota errors
+                                 (default: openai/gpt-oss-120b,openai/gpt-oss-20b)
+  LLM_MODEL                      single model (alternative to LLM_MODELS)
+  LLM_BASE_URL                   default https://api.groq.com/openai/v1
+  DEMO_NAME / DEMO_BUSINESS / DEMO_EMAIL / DEMO_PHONE
+                                 details the agent uses when a site requires a "request demo access" form
 """
 import argparse, json, os, re, sys, time
 from pathlib import Path
@@ -12,12 +16,27 @@ from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 from openai import OpenAI
 
-MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
+# Comma-separated list; the runner moves to the next model when one hits its daily quota.
+MODELS = [m.strip() for m in (os.getenv("LLM_MODELS") or os.getenv("LLM_MODEL")
+          or "openai/gpt-oss-120b,openai/gpt-oss-20b").split(",") if m.strip()]
+MODEL_IDX = 0
+
+
+def switch_model():
+    global MODEL_IDX
+    if MODEL_IDX + 1 < len(MODELS):
+        MODEL_IDX += 1
+        print(f"  switching to model {MODELS[MODEL_IDX]}")
+        return True
+    return False
 client = OpenAI(
     api_key=os.getenv("GROQ_API_KEY") or os.getenv("LLM_API_KEY") or "none",
     base_url=os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1"),
 )
 
+TEST_TEXT = ""      # the plain-English test case (set in run())
+NOTES_REF = []      # live reference to the agent's saved notes (set in run())
+LOGIN_URL = re.compile(r"log-?in|sign-?in|/auth", re.I)
 ALLOWED = ""  # text of the test case + start URL; goto is only allowed to hosts mentioned here
 
 SNAPSHOT_JS = """() => {
@@ -43,6 +62,10 @@ SNAPSHOT_JS = """() => {
     if(e.disabled)o.disabled=true;
     if(e.required)o.required=true;
     if(e.willValidate&&!e.checkValidity())o.invalid=(e.validationMessage||'invalid').slice(0,60);
+    const reg=e.closest('footer,[role=contentinfo],[class*=footer i],[id*=footer i]')?'footer'
+      :(e.closest('header,nav,[role=banner],[role=navigation]')?'header':'');
+    if(reg)o.region=reg;
+    o.y=Math.round(e.getBoundingClientRect().top+scrollY);
     for(const k in o){if(o[k]===''||o[k]===false)delete o[k];}
     out.push(o);
     if(i>=120)break;
@@ -120,6 +143,11 @@ Rules:
 - For a math captcha, read the numbers from the "captcha" hint or the page text and type the exact sum; never guess.
 - If a submit click does nothing ("page did not change"), read "alerts" and any element with "invalid" in the
   snapshot, fix exactly those fields, then submit again. Do not click submit again without changing something.
+- If the start page has a form that grants demo/trial access, fill and submit it BEFORE clicking other links.
+- If you reach a login page and have no credentials from the test case, NOTES or the page, do not try any: use
+  goto to return to the start URL and get them there.
+- Elements have "region" (footer/header) and "y" (vertical position). Footer, header, newsletter and search fields
+  are never login fields: use the email and password fields inside the main login form.
 - Log in with the exact email and password for the requested role from NOTES or "credential_blocks" (Customer
   credentials for a customer login). Never type made-up credentials.
 - If a modal/dialog blocks the page, click its acknowledge/close button first.
@@ -150,8 +178,8 @@ def ask_llm(test, history, snap, notes):
     for _ in range(3):  # retry on malformed JSON or a stray tool call
         try:
           r = client.chat.completions.create(
-            model=MODEL, max_tokens=1500, temperature=temp,
-            extra_body={"reasoning_effort": "low"},  # remove this line if your provider rejects it
+            model=MODELS[MODEL_IDX], max_tokens=1500, temperature=temp,
+            **({"extra_body": {"reasoning_effort": "low"}} if "gpt-oss" in MODELS[MODEL_IDX] else {}),
             messages=[{"role": "system", "content": SYSTEM},
                       {"role": "user", "content": msg}],
           )
@@ -161,7 +189,7 @@ def ask_llm(test, history, snap, notes):
                 continue
             raise
         temp = 0.3
-        last = r.choices[0].message.content or ""
+        last = re.sub(r"<think>.*?</think>", "", r.choices[0].message.content or "", flags=re.S)
         m = re.search(r"\{.*\}", last, re.S)
         if m:
             try:
@@ -183,6 +211,18 @@ def dismiss_overlays(page):
         return ""
 
 
+def attach_debug(pg):
+    """--debug: print failed requests, every POST and JS errors so silent login failures become visible."""
+    def on_resp(r):
+        try:
+            if r.request.method == "POST" or (r.status >= 400 and r.request.resource_type in ("document", "xhr", "fetch")):
+                print(f"    [net] {r.status} {r.request.method} {r.url[:110]}")
+        except Exception:
+            pass
+    pg.on("response", on_resp)
+    pg.on("pageerror", lambda e: print(f"    [js error] {str(e)[:120]}"))
+
+
 def goto_with_retry(page, url, tries=3):
     """Navigate, retrying transient network errors (e.g. ERR_NETWORK_CHANGED, wifi/VPN switches)."""
     last = None
@@ -194,6 +234,22 @@ def goto_with_retry(page, url, tries=3):
             print(f"  navigation to {url} failed ({str(e).splitlines()[0][:90]}); retry {i + 1}/{tries}")
             time.sleep(2 * (i + 1))
     raise last
+
+
+def credential_is_grounded(page, text):
+    """A value typed on a login page must come from the test case, saved notes, or the page itself."""
+    t = text.strip().lower()
+    if not t:
+        return True
+    if t in (TEST_TEXT + "\n" + "\n".join(NOTES_REF)).lower():
+        return True
+    try:
+        body = page.inner_text("body").lower()
+        vals = page.evaluate("() => [...document.querySelectorAll('input[readonly],input[disabled]')]"
+                             ".map(e=>e.value).join(' ')").lower()
+    except Exception:
+        return True
+    return t in body or t in vals
 
 
 def host_allowed(url):
@@ -215,6 +271,26 @@ def execute(page, a, asserts):
     elif t == "click":
         loc().click(timeout=4000)
     elif t == "fill":
+        try:
+            ftype = (loc().get_attribute("type", timeout=1500) or "").lower()
+        except Exception:
+            ftype = ""
+        txt = str(a.get("text", ""))
+        if LOGIN_URL.search(page.url) and ftype in ("password", "email", "text", ""):
+            try:
+                region = loc().evaluate(
+                    "e=>e.closest('footer,[role=contentinfo],[class*=footer i],[id*=footer i]')?'footer':"
+                    "(e.closest('header,nav,[role=banner],[role=navigation]')?'header':'')")
+            except Exception:
+                region = ""
+            if region:
+                raise ValueError(f"BLOCKED: that field is in the page {region}, not the login form. "
+                                 "Choose the email/password field inside the main login form.")
+        if (LOGIN_URL.search(page.url) and ftype in ("password", "email", "text", "")
+                and not re.fullmatch(r"\d{1,6}", txt.strip())
+                and not credential_is_grounded(page, txt)):
+            raise ValueError("BLOCKED: value not in test case, notes or page. Do not guess credentials; "
+                             "go back to the start URL and request demo access there.")
         loc().fill(a["text"], timeout=4000)
         try:
             got = loc().input_value(timeout=1500)
@@ -259,22 +335,35 @@ def execute(page, a, asserts):
         page.wait_for_load_state("domcontentloaded", timeout=5000)
     except Exception:
         pass
+    if t in ("click", "press"):
+        try:
+            page.wait_for_load_state("networkidle", timeout=3000)
+        except Exception:
+            pass
     return "ok" + warn
 
 
-def run(test, start_url, headless, max_steps, outdir):
-    global ALLOWED
+def run(test, start_url, headless, max_steps, outdir, debug=False):
+    global ALLOWED, TEST_TEXT, NOTES_REF
+    TEST_TEXT = test
     ALLOWED = (test + " " + (start_url or "")).lower().replace("www.", "")
     outdir.mkdir(parents=True, exist_ok=True)
     history, asserts, log = [], [], []
     notes, recent, repeats, seen_blocks = [], [], 0, set()
+    NOTES_REF = notes
     last_action_idx = 0  # asserts made before this index belong to an earlier page state
     verdict, reason = "fail", "Step limit reached without a conclusion"
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         ctx = browser.new_context(viewport={"width": 1366, "height": 850})
         cur = {"page": ctx.new_page()}
-        ctx.on("page", lambda pg: cur.update(page=pg))  # follow popups / new tabs
+        def on_new_page(pg):  # follow popups / new tabs
+            cur.update(page=pg)
+            if debug:
+                attach_debug(pg)
+        ctx.on("page", on_new_page)
+        if debug:
+            attach_debug(cur["page"])
         start_err = None
         if start_url:
             try:
@@ -294,6 +383,12 @@ def run(test, start_url, headless, max_steps, outdir):
             except Exception:
                 page.wait_for_timeout(1000)
                 snap = page.evaluate(SNAPSHOT_JS)
+            if debug:  # dump exactly what the model sees each step, plus a screenshot
+                try:
+                    page.screenshot(path=str(outdir / f"step_{step:02d}.png"))
+                except Exception:
+                    pass
+                (outdir / f"step_{step:02d}_snapshot.json").write_text(json.dumps(snap, indent=1))
             for blk in snap.get("credential_blocks") or []:
                 if "@" in blk and re.search("password", blk, re.I) and blk not in seen_blocks:
                     seen_blocks.add(blk)
@@ -305,6 +400,9 @@ def run(test, start_url, headless, max_steps, outdir):
             except Exception as e:
                 msg = str(e)
                 print(f"  step {step}: LLM ERROR -> {msg[:300]}")
+                if any(k in msg for k in ("tokens per day", "(TPD)", "model_not_found", "does not exist")) \
+                        and switch_model():
+                    continue
                 fatal = any(k in msg for k in ("401", "403", "404", "invalid_api_key",
                                                "model_not_found", "decommissioned",
                                                "tokens per day", "(TPD)"))
@@ -394,9 +492,10 @@ if __name__ == "__main__":
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--max-steps", type=int, default=25)
     ap.add_argument("--out", default="results")
+    ap.add_argument("--debug", action="store_true", help="save each step's page snapshot to the output folder")
     args = ap.parse_args()
     t0 = time.time()
-    rep = run(args.test, args.url, args.headless, args.max_steps, Path(args.out))
+    rep = run(args.test, args.url, args.headless, args.max_steps, Path(args.out), args.debug)
     print(f"\n=== {rep['result']} === {rep['reason']}")
     for a in rep["assertions"]:
         print(f"  [{'PASS' if a['passed'] else 'FAIL'}] {a['check']}")

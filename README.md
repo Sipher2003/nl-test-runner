@@ -1,8 +1,6 @@
-# Plain-English Test Runner (Python + Playwright + any LLM)
+# Plain-English Test Runner
 
-Write a test case in plain English; an LLM agent drives a real browser and reports **PASS / FAIL**.
-Nothing is hard-coded to one website. The default LLM provider is Groq (free tier), but any
-OpenAI-compatible API works.
+Write a test case in plain English. An LLM agent runs it in a real browser (Playwright) and reports **PASS** or **FAIL**.
 
 ```bash
 python nl_test_runner.py "Log in as a customer and verify the dashboard is shown" --url https://phptravels.com/demo
@@ -10,33 +8,19 @@ python nl_test_runner.py "Log in as a customer and verify the dashboard is shown
 
 ## How it works
 
-1. **Observe** - injects JS that tags every visible interactive element with a temporary `data-aid` and builds a
-   compact snapshot: url, visible page text, elements (role, text, label, placeholder, options, `required`,
-   `invalid` validation message), visible alerts, captcha context and credential blocks.
-2. **Decide** - sends test case + notes + action history + snapshot to the LLM, which replies with ONE JSON action:
-   `goto`, `click`, `fill`, `select`, `press`, `wait`, `note`, `assert_text`, `assert_no_text`,
-   `assert_url_contains`, `finish`.
-3. **Act** - Playwright executes the action and follows popups / new tabs.
-4. **Verify in code** - assertions are checked against the real page. A test can only PASS if at least one
-   assertion ran **on the final page state** and all of those held. A bare `finish(pass)` with no assertions is
-   rejected, so the model cannot just claim success.
-5. **Report** - console summary, `results/report.json`, `results/final.png`. Exit code 0 = PASS, 1 = FAIL.
+1. **Observe:** the page's visible interactive elements are tagged with temporary ids and sent to the LLM as a compact snapshot (element text, labels, placeholders, location on the page, validation errors, visible alerts and any credentials shown on the page).
+2. **Decide:** the LLM replies with one JSON action: `goto`, `click`, `fill`, `select`, `press`, `wait`, `note`, `assert_text`, `assert_no_text`, `assert_url_contains` or `finish`.
+3. **Act:** Playwright performs the action and follows new tabs.
+4. **Verify in code:** a test can only PASS if the agent ran assertions on the final page state and every one held. The model cannot declare a pass on its own.
+5. **Report:** console summary, `results/report.json`, `results/final.png`. Exit code is `0` for PASS and `1` for FAIL.
 
-## Key behaviours
+Nothing is specific to one website. Safeguards in the code:
 
-- **Never guesses credentials.** It uses credentials from the test text or shown on a page. If none are available
-  it looks for a "request demo access" form, fills it with realistic details, solves a simple math captcha and
-  reads the credentials that appear.
-- **Memory.** Credentials and other facts are saved as notes (via the `note` action and automatic capture of
-  Email/Password blocks) and sent on every turn, so they survive new tabs.
-- **Dialogs.** Acknowledge-style dialogs ("I understand", "Got it", "Accept", "I agree", "OK") are dismissed
-  automatically.
-- **Feedback to the agent.** Each step reports the current URL, whether the page changed, field read-back
-  warnings, and repeat warnings. A run fails after 5 repeats of the same action within 8 steps.
-- **Safe navigation.** `goto` only works for hosts mentioned in the test text or `--url`; page loads retry 3 times
-  on network errors.
-- **Model fallback.** `LLM_MODELS` is tried in order; the runner moves to the next model on daily-quota or
-  model-not-found errors. Per-minute limits wait and retry.
+- Credentials must come from the test text, saved notes or the page. On login pages, typing anything else is blocked, as is typing credentials into footer or header fields.
+- `goto` is limited to hosts named in the test text or `--url`.
+- Acknowledge-style dialogs ("I understand", "Got it", "Accept", "I agree", "OK") are dismissed automatically.
+- If a site needs a demo-access form to reveal credentials, the agent fills it with realistic details and solves simple math captchas.
+- Stuck loops are detected and failed early; navigation errors are retried.
 
 ## Setup
 
@@ -45,91 +29,67 @@ Requires Python 3.9+.
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows PowerShell: .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements.txt    # playwright, openai
 playwright install chromium
 ```
 
-`requirements.txt`:
-```
-playwright
-openai
-```
-
-Set your API key (free key at https://console.groq.com):
+Set an API key. The default provider is Groq, which has a free tier (key at https://console.groq.com):
 
 ```bash
-export GROQ_API_KEY=gsk_...                 # Windows PowerShell: $env:GROQ_API_KEY="gsk_..."
+export GROQ_API_KEY=gsk_...        # Windows PowerShell: $env:GROQ_API_KEY="gsk_..."
 ```
+
+## Run
+
+```bash
+python nl_test_runner.py "<plain-English test case>" [--url START_URL] [--headless] [--max-steps N] [--out DIR] [--debug]
+```
+
+| Option | Purpose |
+|---|---|
+| `--url` | start page (optional if the URL is in the test text) |
+| `--headless` | run without a visible browser |
+| `--max-steps N` | cap on agent steps (default 25) |
+| `--out DIR` | output folder (default `results/`) |
+| `--debug` | save each step's snapshot and screenshot, and print network POSTs and errors |
 
 ### Environment variables
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `GROQ_API_KEY` or `LLM_API_KEY` | API key | - |
-| `LLM_MODELS` | comma-separated models, tried in order | `openai/gpt-oss-120b,openai/gpt-oss-20b` |
-| `LLM_MODEL` | single model (alternative to `LLM_MODELS`) | - |
-| `LLM_BASE_URL` | OpenAI-compatible endpoint | `https://api.groq.com/openai/v1` |
-| `DEMO_NAME`, `DEMO_BUSINESS`, `DEMO_PHONE` | details used if a site requires a demo-access form | Aarav Mehta / Mehta Travel Services / 9820147365 |
-| `DEMO_EMAIL` | email for that form | `aarav.mehta.qa@mailinator.com` (set your own; some sites reject disposable domains) |
+| `GROQ_API_KEY` or `LLM_API_KEY` | API key | none |
+| `LLM_MODELS` | comma-separated models; the next is used when one hits its daily quota | `openai/gpt-oss-120b,openai/gpt-oss-20b` |
+| `LLM_MODEL` | single model (alternative to `LLM_MODELS`) | none |
+| `LLM_BASE_URL` | any OpenAI-compatible endpoint | `https://api.groq.com/openai/v1` |
+| `DEMO_EMAIL` | email for sites that require a demo-access form | `aarav.mehta.qa@mailinator.com` |
+| `DEMO_NAME`, `DEMO_BUSINESS`, `DEMO_PHONE` | other form details | Aarav Mehta, Mehta Travel Services, 9820147365 |
 
-Other providers: set `LLM_BASE_URL`, `LLM_MODEL(S)` and `LLM_API_KEY` (OpenAI, OpenRouter, Cerebras, a local
-Ollama server at `http://localhost:11434/v1`, ...). Check the provider's current model list, since free tiers vary.
+**Please set `DEMO_EMAIL` to an address you control.** Some sites send credentials by email or reject disposable domains, and the default address has not been verified to work.
 
-## Usage
+Other providers (OpenAI, OpenRouter, a local Ollama server and so on) work by changing `LLM_BASE_URL`, `LLM_MODELS` and `LLM_API_KEY`.
+
+## Example test cases
 
 ```bash
-python nl_test_runner.py "<plain-English test case>" [--url START_URL] [--headless] [--max-steps N] [--out DIR]
-```
-
-| Flag | Purpose |
-|---|---|
-| `--url` | start page (optional if a URL is in the test text) |
-| `--headless` | run without a visible browser |
-| `--max-steps N` | cap on agent steps (default 25) |
-| `--out DIR` | where `report.json` and `final.png` go (default `results/`) |
-
-PowerShell example:
-
-```powershell
-$env:GROQ_API_KEY="gsk_..."
-$env:DEMO_EMAIL="your.name@gmail.com"
-$env:LLM_MODELS="openai/gpt-oss-120b,openai/gpt-oss-20b"
 python nl_test_runner.py "Log in as a customer and verify the dashboard is shown" --url https://phptravels.com/demo
-```
-
-## Demo test cases
-
-### Tried on the phptravels demo
-
-| # | Test case | Outcome | Notes |
-|---|---|---|---|
-| 1 | `Open phptravels.com/demo, open the customer demo, log in as a customer and verify the dashboard is shown` | FAIL | Agent guessed credentials and got "Invalid Credentials". |
-| 2 | `On the demo page, request demo access with name Test User, business Test Agency, email test.user@example.com, country India, WhatsApp 9876543210, and submit. When the credentials appear, note the customer email and password, open the customer account, log in with them and verify the customer dashboard is shown` | FAIL | Site rejected placeholder data ("Please enter your real name, not a placeholder", HTTP 422). Captcha was solved correctly; Country is pre-filled. |
-| 3 | `Log in as a customer and verify the dashboard is shown` | FAIL | Form and captcha worked; login was blocked by a "Demo Environment" dialog and credentials lost when a new tab opened. |
-| 4 | Same as #3, latest version | (add result) | - |
-
-### Suggested cases
-
-```bash
 python nl_test_runner.py "Log in as a customer with a wrong password and verify an error message is shown" --url https://phptravels.com/demo
 python nl_test_runner.py "Go to https://www.saucedemo.com, log in as standard_user with secret_sauce and verify the products page is shown"
-python nl_test_runner.py "Go to https://www.saucedemo.com, log in as locked_out_user with secret_sauce and verify a locked out error is shown"
 ```
 
-## Troubleshooting
+## Test status
 
-| Symptom | Cause / fix |
-|---|---|
-| `429 ... tokens per day (TPD)` | Daily quota for that model is used up. The runner switches to the next model in `LLM_MODELS`; otherwise wait or use another provider. |
-| `429 ... tokens per minute` | Free plans have a small per-minute cap (about 8K tokens on Groq). The runner waits and retries. |
-| `404 ... model does not exist` | Model renamed or retired. List current ones: `curl https://api.groq.com/openai/v1/models -H "Authorization: Bearer $GROQ_API_KEY"` |
-| `net::ERR_NETWORK_CHANGED` | Network or VPN changed mid-load. Retried automatically; keep the connection stable. |
-| Form says "not a placeholder" / rejects the email | Set realistic `DEMO_*` values or your own `DEMO_EMAIL`. |
-| Agent keeps repeating one action | Stuck detection fails the run at 5 repeats. Make the test text more specific. |
+- The phptravels customer-login case above has been run to a PASS: the agent submitted the demo-access form, read the customer credentials from the page, logged in, and the runner confirmed the dashboard.
+- It took many attempts to get there, and it was a single clean run. LLM behaviour varies between runs, so results are not guaranteed to be repeatable.
+- The wrong-password and saucedemo cases are suggestions and have **not** been run.
+- No other websites have been tested.
 
-## Limitations / next steps
+## Limitations
 
-- iframes and shadow DOM are not snapshotted yet (loop over `page.frames`).
-- An image-based captcha cannot be solved from text; it needs a vision-capable model with screenshots.
-- Free tiers have small token caps; add a token budget and cache successful action sequences for fast replays.
-- Auto-dismissed dialogs are limited to acknowledge-style buttons so the runner does not click through dialogs a test needs.
+- **Free-tier models are limited and not fully reliable.** On Groq's free plan there is a daily token quota per model and a small per-minute cap. A run can exhaust the daily quota, and the agent sometimes picks the wrong element, repeats actions or takes extra steps. A typical run takes several minutes.
+- **Results depend on the model.** The smaller fallback model is less accurate than the larger one.
+- **Assertions are only as good as the model's choice.** The code guarantees assertions ran and held, but not that they are the strongest possible check. The test text should state the expected outcome clearly.
+- **Captchas:** only simple math captchas that appear as text can be solved. Image-based captchas and bot-protection challenges are not supported.
+- **Page structure:** iframes and shadow DOM are not read, so elements inside them are invisible to the agent.
+- **Dialog handling is conservative:** only acknowledge-style buttons are clicked automatically, so other blocking dialogs must be handled by the agent.
+- **Sites that need real accounts or real data** (payments, email verification, one-time codes) cannot be tested.
+- **The tool may submit forms on live sites.** Do not point it at sites you do not have permission to test.
