@@ -1,2 +1,3 @@
 playwright
 openai
+imageio-ffmpeg

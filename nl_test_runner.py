@@ -10,7 +10,7 @@ Works with any OpenAI-compatible API (Groq by default).
   DEMO_NAME / DEMO_BUSINESS / DEMO_EMAIL / DEMO_PHONE
                                  details the agent uses when a site requires a "request demo access" form
 """
-import argparse, json, os, re, sys, time
+import argparse, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
@@ -86,7 +86,13 @@ SNAPSHOT_JS = """() => {
   const captcha=[...document.querySelectorAll('input,select')]
     .filter(x=>vis(x)&&/captcha|security|human|robot|verif/i.test((x.name||'')+(x.id||'')+(x.placeholder||'')+(x.className||'')+(x.getAttribute('aria-label')||'')))
     .map(x=>{const c=x.closest('div,fieldset,form');return clean((c&&c.innerText)||'').slice(0,100);}).slice(0,2);
-  return {url:location.href,title:document.title,alerts,captcha,credential_blocks,
+  let math='';
+  {const txt=[document.body.innerText,...captcha].join(' | ');
+   const m=txt.match(/(\\d+)\\s*([+\\-×x*÷\\/])\\s*(\\d+)\\s*=/);
+   if(m){const a=+m[1],b=+m[3];
+     const r={'+':a+b,'-':a-b,'×':a*b,'x':a*b,'*':a*b,'÷':b?a/b:'','/':b?a/b:''}[m[2]];
+     math=m[0].replace(/\\s+/g,' ')+' '+r;}}
+  return {url:location.href,title:document.title,alerts,captcha,math_captcha:math,credential_blocks,
           page_text:clean(document.body.innerText).slice(0,3500),elements:out};
 }"""
 
@@ -140,7 +146,8 @@ Rules:
 - As soon as credentials appear on a page, save them with a "note" action BEFORE clicking anything that opens another
   page or tab. Notes are shown to you every turn.
 - Fill EVERY field of a form, including dropdowns/selects such as country (use "select"), before submitting.
-- For a math captcha, read the numbers from the "captcha" hint or the page text and type the exact sum; never guess.
+- For a math captcha, use "math_captcha" (e.g. "14 × 8 = 112": type the number after '='). If it is empty, wait and look
+  again, or read the numbers from "captcha" / the page text. Never guess.
 - If a submit click does nothing ("page did not change"), read "alerts" and any element with "invalid" in the
   snapshot, fix exactly those fields, then submit again. Do not click submit again without changing something.
 - If the start page has a form that grants demo/trial access, fill and submit it BEFORE clicking other links.
@@ -209,6 +216,30 @@ def dismiss_overlays(page):
         return t
     except Exception:
         return ""
+
+
+def merge_videos(files, out_path):
+    """Join the per-tab recordings into one MP4. Needs ffmpeg (system, or `pip install imageio-ffmpeg`)."""
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        try:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            return None
+    n = len(files)
+    cmd = [exe, "-y"]
+    for f in files:
+        cmd += ["-i", str(f)]
+    filt = "".join(f"[{i}:v]scale=1366:850,setsar=1[v{i}];" for i in range(n))
+    filt += "".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v]"
+    cmd += ["-filter_complex", filt, "-map", "[v]", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-preset", "veryfast", str(out_path)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=300)
+    except Exception:
+        return None
+    return out_path if r.returncode == 0 and out_path.exists() else None
 
 
 def attach_debug(pg):
@@ -343,7 +374,7 @@ def execute(page, a, asserts):
     return "ok" + warn
 
 
-def run(test, start_url, headless, max_steps, outdir, debug=False):
+def run(test, start_url, headless, max_steps, outdir, debug=False, video=True):
     global ALLOWED, TEST_TEXT, NOTES_REF
     TEST_TEXT = test
     ALLOWED = (test + " " + (start_url or "")).lower().replace("www.", "")
@@ -351,14 +382,21 @@ def run(test, start_url, headless, max_steps, outdir, debug=False):
     history, asserts, log = [], [], []
     notes, recent, repeats, seen_blocks = [], [], 0, set()
     NOTES_REF = notes
+    early_fail_retries = 0
     last_action_idx = 0  # asserts made before this index belong to an earlier page state
     verdict, reason = "fail", "Step limit reached without a conclusion"
+    video_out = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        ctx = browser.new_context(viewport={"width": 1366, "height": 850})
+        ctx = browser.new_context(
+            viewport={"width": 1366, "height": 850},
+            record_video_dir=str(outdir / "_videos") if video else None,
+            record_video_size={"width": 1366, "height": 850})
         cur = {"page": ctx.new_page()}
+        pages = [cur["page"]]
         def on_new_page(pg):  # follow popups / new tabs
             cur.update(page=pg)
+            pages.append(pg)
             if debug:
                 attach_debug(pg)
         ctx.on("page", on_new_page)
@@ -368,6 +406,11 @@ def run(test, start_url, headless, max_steps, outdir, debug=False):
         if start_url:
             try:
                 goto_with_retry(cur["page"], start_url)
+                try:
+                    cur["page"].wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                cur["page"].wait_for_timeout(1000)
             except Exception as e:
                 start_err = str(e).splitlines()[0][:200]
                 reason = f"Could not open start URL {start_url}: {start_err}"
@@ -423,6 +466,15 @@ def run(test, start_url, headless, max_steps, outdir, debug=False):
             if a.get("action") == "finish":
                 v = str(a.get("verdict", "fail")).lower()
                 final = asserts[last_action_idx:]
+                if v == "fail" and step <= 3 and early_fail_retries < 2:
+                    early_fail_retries += 1
+                    note = ("finish(fail) rejected: too early to give up. The page may still be loading; "
+                            "look again at the latest snapshot (math_captcha, credential_blocks) and act.")
+                    print(f"  step {step}: {note}")
+                    history.append(f"{step}. {note}")
+                    log.append({"step": step, "action": a, "result": note})
+                    page.wait_for_timeout(2500)
+                    continue
                 if v == "pass" and not final:
                     # don't accept a bare "pass": make the agent prove it
                     note = "finish(pass) rejected: run assert_* actions on the current page first."
@@ -470,6 +522,25 @@ def run(test, start_url, headless, max_steps, outdir, debug=False):
         except Exception:
             pass
         final_url = cur["page"].url
+        ctx.close()  # finalises the recordings
+        if video:
+            parts = []
+            for i, pg in enumerate(pages, 1):
+                try:
+                    if pg.video:
+                        dest = outdir / f"video_{i}.webm"
+                        pg.video.save_as(str(dest))
+                        parts.append(dest)
+                except Exception:
+                    pass
+            shutil.rmtree(outdir / "_videos", ignore_errors=True)
+            merged = merge_videos(parts, outdir / "run.mp4") if parts else None
+            if merged:
+                for f in parts:
+                    f.unlink(missing_ok=True)
+                video_out = [str(merged)]
+            else:
+                video_out = [str(f) for f in parts]
         browser.close()
 
     # Final verdict is enforced in code: only assertions made on the final page state count.
@@ -480,7 +551,7 @@ def run(test, start_url, headless, max_steps, outdir, debug=False):
         elif not all(ok for _, ok in final):
             verdict, reason = "fail", "Assertion failed: " + "; ".join(n for n, ok in final if not ok)
     report = {"test": test, "result": verdict.upper(), "reason": reason, "final_url": final_url,
-              "assertions": [{"check": n, "passed": ok} for n, ok in asserts], "steps": log}
+              "assertions": [{"check": n, "passed": ok} for n, ok in asserts], "video": video_out, "steps": log}
     (outdir / "report.json").write_text(json.dumps(report, indent=2))
     return report
 
@@ -492,12 +563,15 @@ if __name__ == "__main__":
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--max-steps", type=int, default=25)
     ap.add_argument("--out", default="results")
+    ap.add_argument("--no-video", action="store_true", help="do not record a video of the run")
     ap.add_argument("--debug", action="store_true", help="save each step's page snapshot to the output folder")
     args = ap.parse_args()
     t0 = time.time()
-    rep = run(args.test, args.url, args.headless, args.max_steps, Path(args.out), args.debug)
+    rep = run(args.test, args.url, args.headless, args.max_steps, Path(args.out), args.debug, not args.no_video)
     print(f"\n=== {rep['result']} === {rep['reason']}")
     for a in rep["assertions"]:
         print(f"  [{'PASS' if a['passed'] else 'FAIL'}] {a['check']}")
+    for v in rep.get("video", []):
+        print(f"video: {v}")
     print(f"({time.time()-t0:.0f}s) report: {args.out}/report.json")
     sys.exit(0 if rep["result"] == "PASS" else 1)
